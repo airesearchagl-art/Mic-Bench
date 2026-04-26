@@ -4,6 +4,7 @@ Mic-Bench: Multi-Microphone Accuracy Comparison Tool
 
 import sys
 import csv
+import os
 import queue
 import threading
 import time
@@ -42,41 +43,31 @@ TRANSCRIPT_MAX_LINES = 80
 NOISE_BUF_LEN = 200      # max silent-chunk RMS values to retain
 NOISE_MIN_SAMPLES = 20   # require at least this many silent chunks before SNR is valid
 
+# ── Offline model directory (./whisper_model/<size>/) ────────────────────────
+WHISPER_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper_model")
+
 # ── Global Whisper model (lazy, shared across all panels) ─────────────────────
 _WHISPER_MODEL = None
 _WHISPER_LOADED_SIZE = ""
 _WHISPER_LOCK = threading.Lock()
 
 
-def _decode_device_name(raw: "str | bytes") -> str:
-    """Decode a PyAudio device name robustly on Windows.
+def _decode_device_name(raw: str) -> str:
+    """Decode a PyAudio device name for Japanese Windows (CP932/Shift-JIS).
 
-    PortAudio returns device names as a C string that PyAudio may decode
-    with the wrong codec (e.g., Shift-JIS names mis-decoded as Latin-1).
-    This re-encodes the string as Latin-1 then retries UTF-8 / CP932.
+    PyAudio on Windows receives device names as Shift-JIS bytes from
+    PortAudio, then blindly decodes them as Latin-1, producing mojibake.
+    Re-encoding as Latin-1 recovers the original bytes; CP932 then gives
+    the correct Japanese string.
     """
-    if isinstance(raw, bytes):
-        for enc in ("utf-8", "cp932", "latin-1"):
-            try:
-                return raw.decode(enc)
-            except (UnicodeDecodeError, AttributeError):
-                continue
-        return raw.decode("latin-1", errors="replace")
-    # raw is a str — attempt to fix potential mojibake
     try:
-        encoded = raw.encode("latin-1")
-    except UnicodeEncodeError:
-        return raw  # already valid non-Latin-1 Unicode
-    for enc in ("utf-8", "cp932"):
-        try:
-            return encoded.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw
+        return raw.encode("latin-1").decode("cp932")
+    except Exception:
+        return raw
 
 
 def _get_model(size: str):
-    """Load (or return cached) WhisperModel. Thread-safe with retry logic."""
+    """Load (or return cached) WhisperModel from local directory. Never contacts the network."""
     global _WHISPER_MODEL, _WHISPER_LOADED_SIZE
     from faster_whisper import WhisperModel  # deferred import
 
@@ -86,34 +77,38 @@ def _get_model(size: str):
 
         _WHISPER_LOADED_SIZE = size
         _WHISPER_MODEL = None
-        last_exc: Exception | None = None
 
+        model_path = os.path.join(WHISPER_MODEL_DIR, size)
+        if not os.path.isdir(model_path):
+            raise FileNotFoundError(
+                f"モデルフォルダが見つかりません: {model_path}\n"
+                f"./whisper_model/{size}/ 内にモデルファイルを配置してください。\n"
+                "（例: whisper_model/base/model.bin など）"
+            )
+
+        last_exc: Exception | None = None
         for device, compute in [("cuda", "float16"), ("cpu", "int8")]:
-            for attempt in range(3):
-                try:
-                    _WHISPER_MODEL = WhisperModel(
-                        size,
-                        device=device,
-                        compute_type=compute,
-                        local_files_only=False,
-                    )
-                    return _WHISPER_MODEL
-                except Exception as exc:
-                    last_exc = exc
-                    low = str(exc).lower()
-                    # CUDA not available → skip all CUDA retries immediately
-                    if device == "cuda" and any(
-                        k in low for k in ("cuda", "cudnn", "gpu", "no module named")
-                    ):
-                        break
-                    # Transient network error → exponential backoff
-                    if attempt < 2:
-                        time.sleep(1.5 ** attempt)  # ~1 s, ~2.25 s
+            try:
+                _WHISPER_MODEL = WhisperModel(
+                    model_path,
+                    device=device,
+                    compute_type=compute,
+                    local_files_only=True,
+                )
+                return _WHISPER_MODEL
+            except Exception as exc:
+                last_exc = exc
+                low = str(exc).lower()
+                # CUDA unavailable → fall through to CPU silently
+                if device == "cuda" and any(
+                    k in low for k in ("cuda", "cudnn", "gpu", "no module named")
+                ):
+                    continue
+                raise  # CPU load failure: unexpected, surface immediately
 
         raise RuntimeError(
             f"Whisper '{size}' の読み込みに失敗しました。\n"
-            f"詳細: {last_exc}\n"
-            "インターネット接続を確認するか、別のモデルサイズを試してください。"
+            f"詳細: {last_exc}"
         )
 
 
@@ -500,12 +495,15 @@ class DevicePanel(QFrame):
 
     def _populate_combo(self):
         self.combo.clear()
-        self.combo.addItem("-- Select device --", userData=-1)
+        self.combo.addItem("-- デバイスを選択 --", userData=-1)
         for i in range(self.pa.get_device_count()):
             info = self.pa.get_device_info_by_index(i)
             if info["maxInputChannels"] > 0:
-                name = _decode_device_name(info["name"])
-                self.combo.addItem(name, userData=i)
+                try:
+                    name = info["name"].encode("latin-1").decode("cp932")
+                except Exception:
+                    name = info["name"]
+                self.combo.addItem(f"[ID: {i}] {name}", userData=i)
 
     def _on_combo_changed(self):
         idx = self.combo.currentData()
@@ -514,8 +512,11 @@ class DevicePanel(QFrame):
             return
         try:
             info = self.pa.get_device_info_by_index(idx)
-            name = _decode_device_name(info["name"])
-            self.name_label.setText(f"{name}\n({int(info['defaultSampleRate'])} Hz)")
+            try:
+                name = info["name"].encode("latin-1").decode("cp932")
+            except Exception:
+                name = info["name"]
+            self.name_label.setText(f"[ID: {idx}] {name}\n({int(info['defaultSampleRate'])} Hz)")
         except Exception:
             self.name_label.setText("")
 
