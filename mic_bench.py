@@ -18,7 +18,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QPushButton, QProgressBar, QFrame,
+    QGridLayout, QLabel, QComboBox, QPushButton, QProgressBar, QFrame,
     QFileDialog, QMessageBox, QScrollArea, QPlainTextEdit,
 )
 
