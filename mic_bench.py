@@ -48,22 +48,73 @@ _WHISPER_LOADED_SIZE = ""
 _WHISPER_LOCK = threading.Lock()
 
 
+def _decode_device_name(raw: "str | bytes") -> str:
+    """Decode a PyAudio device name robustly on Windows.
+
+    PortAudio returns device names as a C string that PyAudio may decode
+    with the wrong codec (e.g., Shift-JIS names mis-decoded as Latin-1).
+    This re-encodes the string as Latin-1 then retries UTF-8 / CP932.
+    """
+    if isinstance(raw, bytes):
+        for enc in ("utf-8", "cp932", "latin-1"):
+            try:
+                return raw.decode(enc)
+            except (UnicodeDecodeError, AttributeError):
+                continue
+        return raw.decode("latin-1", errors="replace")
+    # raw is a str — attempt to fix potential mojibake
+    try:
+        encoded = raw.encode("latin-1")
+    except UnicodeEncodeError:
+        return raw  # already valid non-Latin-1 Unicode
+    for enc in ("utf-8", "cp932"):
+        try:
+            return encoded.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw
+
+
 def _get_model(size: str):
-    """Load (or return cached) WhisperModel. Thread-safe."""
+    """Load (or return cached) WhisperModel. Thread-safe with retry logic."""
     global _WHISPER_MODEL, _WHISPER_LOADED_SIZE
     from faster_whisper import WhisperModel  # deferred import
+
     with _WHISPER_LOCK:
-        if _WHISPER_MODEL is None or _WHISPER_LOADED_SIZE != size:
-            _WHISPER_LOADED_SIZE = size
-            try:
-                _WHISPER_MODEL = WhisperModel(
-                    size, device="cuda", compute_type="float16"
-                )
-            except Exception:
-                _WHISPER_MODEL = WhisperModel(
-                    size, device="cpu", compute_type="int8"
-                )
-        return _WHISPER_MODEL
+        if _WHISPER_MODEL is not None and _WHISPER_LOADED_SIZE == size:
+            return _WHISPER_MODEL
+
+        _WHISPER_LOADED_SIZE = size
+        _WHISPER_MODEL = None
+        last_exc: Exception | None = None
+
+        for device, compute in [("cuda", "float16"), ("cpu", "int8")]:
+            for attempt in range(3):
+                try:
+                    _WHISPER_MODEL = WhisperModel(
+                        size,
+                        device=device,
+                        compute_type=compute,
+                        local_files_only=False,
+                    )
+                    return _WHISPER_MODEL
+                except Exception as exc:
+                    last_exc = exc
+                    low = str(exc).lower()
+                    # CUDA not available → skip all CUDA retries immediately
+                    if device == "cuda" and any(
+                        k in low for k in ("cuda", "cudnn", "gpu", "no module named")
+                    ):
+                        break
+                    # Transient network error → exponential backoff
+                    if attempt < 2:
+                        time.sleep(1.5 ** attempt)  # ~1 s, ~2.25 s
+
+        raise RuntimeError(
+            f"Whisper '{size}' の読み込みに失敗しました。\n"
+            f"詳細: {last_exc}\n"
+            "インターネット接続を確認するか、別のモデルサイズを試してください。"
+        )
 
 
 def _resample_to_16k(samples: np.ndarray, src_rate: int) -> np.ndarray:
@@ -206,7 +257,12 @@ class TranscriptionWorker(QObject):
         try:
             model = _get_model(self._model_size)
         except Exception as e:
-            self.status_changed.emit(self.slot_index, f"Model error: {e}")
+            self.status_changed.emit(self.slot_index, "Model load failed")
+            self.transcription_ready.emit(
+                self.slot_index,
+                f"[モデル読み込みエラー]\n{e}\n\n"
+                "→ Stop → Start で再試行してください。",
+            )
             return
 
         self.status_changed.emit(self.slot_index, "Listening…")
@@ -448,7 +504,8 @@ class DevicePanel(QFrame):
         for i in range(self.pa.get_device_count()):
             info = self.pa.get_device_info_by_index(i)
             if info["maxInputChannels"] > 0:
-                self.combo.addItem(info["name"], userData=i)
+                name = _decode_device_name(info["name"])
+                self.combo.addItem(name, userData=i)
 
     def _on_combo_changed(self):
         idx = self.combo.currentData()
@@ -457,9 +514,8 @@ class DevicePanel(QFrame):
             return
         try:
             info = self.pa.get_device_info_by_index(idx)
-            self.name_label.setText(
-                f"{info['name']}\n({int(info['defaultSampleRate'])} Hz)"
-            )
+            name = _decode_device_name(info["name"])
+            self.name_label.setText(f"{name}\n({int(info['defaultSampleRate'])} Hz)")
         except Exception:
             self.name_label.setText("")
 
@@ -772,12 +828,11 @@ class MicBench(QMainWindow):
 
     def _save_report_csv(self):
         rows = [p.get_report_data() for p in self.panels]
-        active_rows = [r for r in rows if r["segments"] > 0 or r["transcript"]]
-        if not active_rows:
-            QMessageBox.information(
-                self, "No Data",
-                "No transcription data has been collected yet.\n"
-                "Start recording and speak into at least one microphone first.",
+        if not any(r["segments"] > 0 for r in rows):
+            QMessageBox.warning(
+                self, "データなし",
+                "保存するデータがありません。\n"
+                "録音を完了させてから試してください。",
             )
             return
 
