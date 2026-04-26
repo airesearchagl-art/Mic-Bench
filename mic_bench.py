@@ -5,6 +5,8 @@ Mic-Bench: Multi-Microphone Accuracy Comparison Tool
 import sys
 import queue
 import threading
+import time
+from collections import deque
 from math import gcd
 
 import numpy as np
@@ -33,6 +35,10 @@ MIN_SEGMENT_SECS = 0.5   # discard segments shorter than this
 SILENCE_RMS = 0.008      # normalised RMS below which a chunk is "silent"
 SILENCE_SECS = 0.6       # flush after this many seconds of continuous silence
 TRANSCRIPT_MAX_LINES = 80
+
+# ── S/N calibration constants ─────────────────────────────────────────────────
+NOISE_BUF_LEN = 200      # max silent-chunk RMS values to retain
+NOISE_MIN_SAMPLES = 20   # require at least this many silent chunks before SNR is valid
 
 # ── Global Whisper model (lazy, shared across all panels) ─────────────────────
 _WHISPER_MODEL = None
@@ -80,6 +86,8 @@ class AudioWorker(QObject):
         self._running = False
         self._lock = threading.Lock()
         self._latest_rms = 0.0
+        self._current_rms_raw = 0.0
+        self._noise_buf: deque[float] = deque(maxlen=NOISE_BUF_LEN)
 
     def start(self):
         self._running = True
@@ -91,6 +99,23 @@ class AudioWorker(QObject):
     def get_rms(self) -> float:
         with self._lock:
             return self._latest_rms
+
+    def get_snr_stats(self) -> tuple[float | None, float]:
+        """Return (noise_floor_linear | None, current_rms_linear).
+
+        noise_floor is the 10th-percentile of silent-chunk RMS values.
+        None is returned until NOISE_MIN_SAMPLES silent chunks are collected.
+        """
+        with self._lock:
+            cur = self._current_rms_raw
+            if len(self._noise_buf) < NOISE_MIN_SAMPLES:
+                return None, cur
+            nf = float(np.percentile(list(self._noise_buf), 10))
+            return nf, cur
+
+    def reset_noise_floor(self):
+        with self._lock:
+            self._noise_buf.clear()
 
     def _run(self):
         pa = pyaudio.PyAudio()
@@ -124,6 +149,9 @@ class AudioWorker(QObject):
 
             with self._lock:
                 self._latest_rms = min(rms * 5.0, 1.0)
+                self._current_rms_raw = rms
+                if rms < SILENCE_RMS:
+                    self._noise_buf.append(rms)
 
             buf.append(samples)
             buf_n += len(samples)
@@ -148,6 +176,9 @@ class AudioWorker(QObject):
 
 class TranscriptionWorker(QObject):
     transcription_ready = pyqtSignal(int, str)
+    # (slot, confidence_pct, latency_secs)
+    # confidence = clamp((avg_logprob + 1.0) * 100, 0, 100)
+    metrics_ready = pyqtSignal(int, float, float)
     status_changed = pyqtSignal(int, str)
 
     _STOP = object()  # sentinel value
@@ -188,16 +219,26 @@ class TranscriptionWorker(QObject):
                 break
 
             self.status_changed.emit(self.slot_index, "Transcribing…")
+            t0 = time.perf_counter()
             try:
-                # Consume the lazy generator inside the lock so inference is serialised.
+                # list() forces the lazy generator inside the lock so all inference
+                # is serialised and latency is measured correctly.
                 with _WHISPER_LOCK:
-                    segs, _ = model.transcribe(
+                    segs_gen, _ = model.transcribe(
                         seg,
                         beam_size=1,
                         vad_filter=True,
                         language=None,  # auto-detect
                     )
-                    text = " ".join(s.text.strip() for s in segs).strip()
+                    collected = list(segs_gen)
+                latency = time.perf_counter() - t0
+
+                text = " ".join(s.text.strip() for s in collected).strip()
+
+                if collected:
+                    avg_lp = sum(s.avg_logprob for s in collected) / len(collected)
+                    confidence = max(0.0, min(100.0, (avg_lp + 1.0) * 100.0))
+                    self.metrics_ready.emit(self.slot_index, confidence, latency)
             except Exception as e:
                 self.status_changed.emit(self.slot_index, f"Error: {e}")
                 continue
@@ -279,6 +320,46 @@ class DevicePanel(QFrame):
         self.db_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.db_label)
 
+        # ── Metrics grid ─────────────────────────────────────────────────
+        metrics_frame = QFrame()
+        metrics_frame.setStyleSheet(
+            "background: #161616; border: 1px solid #2a2a2a; border-radius: 5px;"
+        )
+        mg = QGridLayout(metrics_frame)
+        mg.setContentsMargins(8, 5, 8, 5)
+        mg.setHorizontalSpacing(6)
+        mg.setVerticalSpacing(3)
+        mg.setColumnStretch(1, 1)
+
+        def _metric_label(text: str) -> QLabel:
+            w = QLabel(text)
+            w.setFont(QFont("Segoe UI", 7))
+            w.setStyleSheet("color: #607d8b; background: transparent; border: none;")
+            return w
+
+        def _metric_value(init: str = "---") -> QLabel:
+            w = QLabel(init)
+            w.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+            w.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            w.setStyleSheet("color: #e0e0e0; background: transparent; border: none;")
+            return w
+
+        self.conf_val  = _metric_value()
+        self.lat_val   = _metric_value()
+        self.noise_val = _metric_value()
+        self.snr_val   = _metric_value()
+
+        mg.addWidget(_metric_label("Confidence:"), 0, 0)
+        mg.addWidget(self.conf_val,                0, 1)
+        mg.addWidget(_metric_label("Latency:"),    1, 0)
+        mg.addWidget(self.lat_val,                 1, 1)
+        mg.addWidget(_metric_label("Base Noise:"), 2, 0)
+        mg.addWidget(self.noise_val,               2, 1)
+        mg.addWidget(_metric_label("SNR:"),        3, 0)
+        mg.addWidget(self.snr_val,                 3, 1)
+
+        layout.addWidget(metrics_frame)
+
         # ── Start / Stop ─────────────────────────────────────────────────
         self.btn = QPushButton("Start")
         self.btn.setCheckable(True)
@@ -318,7 +399,7 @@ class DevicePanel(QFrame):
         self.tx_status.setFont(QFont("Segoe UI", 7))
         self.tx_status.setStyleSheet("color: #78909c;")
         tx_row.addWidget(self.tx_status)
-        clear_btn = QPushButton("Clear")
+        clear_btn = QPushButton("Clear Text")
         clear_btn.setFixedHeight(18)
         clear_btn.setFont(QFont("Segoe UI", 7))
         clear_btn.setStyleSheet(
@@ -344,6 +425,13 @@ class DevicePanel(QFrame):
         """)
         self.transcript.setPlaceholderText("Transcript will appear here…")
         layout.addWidget(self.transcript, stretch=1)
+
+    # ── Metric helpers ────────────────────────────────────────────────────────
+
+    def _reset_metric_labels(self):
+        for lbl in (self.conf_val, self.lat_val, self.noise_val, self.snr_val):
+            lbl.setText("---")
+            lbl.setStyleSheet("color: #e0e0e0; background: transparent; border: none;")
 
     # ── Device helpers ────────────────────────────────────────────────────────
 
@@ -409,6 +497,7 @@ class DevicePanel(QFrame):
                 self.slot_index, seg_queue, self._model_size_getter()
             )
             self.tx_worker.transcription_ready.connect(self._on_transcript)
+            self.tx_worker.metrics_ready.connect(self._on_metrics)
             self.tx_worker.status_changed.connect(self._on_tx_status)
             self.tx_worker.start()
 
@@ -417,6 +506,7 @@ class DevicePanel(QFrame):
             self.status_label.setText(f"Recording @ {rate} Hz")
             self.status_label.setStyleSheet("color: #69f0ae;")
             self.combo.setEnabled(False)
+            self.noise_val.setText("Calibrating…")
         else:
             self._stop_workers()
             self.btn.setText("Start")
@@ -426,6 +516,7 @@ class DevicePanel(QFrame):
             self.combo.setEnabled(True)
             self.meter.setValue(0)
             self.db_label.setText("--- dBFS")
+            self._reset_metric_labels()
 
     def _stop_workers(self):
         # Stop audio first so no more segments are enqueued, then signal tx_worker.
@@ -449,10 +540,24 @@ class DevicePanel(QFrame):
     def _on_transcript(self, _slot: int, text: str):
         self.transcript.appendPlainText(text)
 
+    def _on_metrics(self, _slot: int, confidence: float, latency: float):
+        self.conf_val.setText(f"{confidence:.1f} %")
+        self.lat_val.setText(f"{latency:.2f} s")
+        # Green ≥70 %, yellow ≥40 %, red <40 %
+        if confidence >= 70:
+            color = "#69f0ae"
+        elif confidence >= 40:
+            color = "#ffeb3b"
+        else:
+            color = "#f44336"
+        self.conf_val.setStyleSheet(
+            f"color: {color}; background: transparent; border: none;"
+        )
+
     def _on_tx_status(self, _slot: int, msg: str):
         self.tx_status.setText(msg)
 
-    # ── Meter refresh (called from main QTimer) ───────────────────────────────
+    # ── Meter + SNR refresh (called from main QTimer) ─────────────────────────
 
     def refresh_meter(self):
         if not self._active or self.worker is None:
@@ -463,6 +568,19 @@ class DevicePanel(QFrame):
             self.db_label.setText(f"{20 * np.log10(rms + 1e-9):+.1f} dBFS")
         else:
             self.db_label.setText("--- dBFS")
+
+        nf, cur = self.worker.get_snr_stats()
+        if nf is None:
+            # Keep the "Calibrating…" text set at start; don't overwrite yet.
+            self.snr_val.setText("---")
+        else:
+            nf_db = 20 * np.log10(max(nf, 1e-9))
+            self.noise_val.setText(f"{nf_db:+.1f} dBFS")
+            if cur > nf > 0:
+                snr_db = 20 * np.log10(cur / nf)
+                self.snr_val.setText(f"{snr_db:+.1f} dB")
+            else:
+                self.snr_val.setText("0.0 dB")
 
     def closedown(self):
         self._stop_workers()
