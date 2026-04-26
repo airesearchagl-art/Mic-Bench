@@ -3,10 +3,12 @@ Mic-Bench: Multi-Microphone Accuracy Comparison Tool
 """
 
 import sys
+import csv
 import queue
 import threading
 import time
 from collections import deque
+from datetime import datetime
 from math import gcd
 
 import numpy as np
@@ -17,7 +19,7 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QProgressBar, QFrame,
-    QMessageBox, QScrollArea, QPlainTextEdit,
+    QFileDialog, QMessageBox, QScrollArea, QPlainTextEdit,
 )
 
 # ── Audio constants ───────────────────────────────────────────────────────────
@@ -261,6 +263,11 @@ class DevicePanel(QFrame):
         self.tx_worker: TranscriptionWorker | None = None
         self._active = False
 
+        # Per-session metric accumulators (reset on each Start, kept after Stop)
+        self._confidence_history: list[float] = []
+        self._latency_history: list[float] = []
+        self._snr_history: list[float] = []
+
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFrameShadow(QFrame.Shadow.Raised)
         self.setMinimumWidth(260)
@@ -501,6 +508,11 @@ class DevicePanel(QFrame):
             self.tx_worker.status_changed.connect(self._on_tx_status)
             self.tx_worker.start()
 
+            # Reset accumulators for the new session
+            self._confidence_history.clear()
+            self._latency_history.clear()
+            self._snr_history.clear()
+
             self._active = True
             self.btn.setText("Stop")
             self.status_label.setText(f"Recording @ {rate} Hz")
@@ -541,6 +553,14 @@ class DevicePanel(QFrame):
         self.transcript.appendPlainText(text)
 
     def _on_metrics(self, _slot: int, confidence: float, latency: float):
+        # Accumulate for report export
+        self._confidence_history.append(confidence)
+        self._latency_history.append(latency)
+        if self.worker:
+            nf, cur = self.worker.get_snr_stats()
+            if nf is not None and nf > 0 and cur > nf:
+                self._snr_history.append(20 * np.log10(cur / nf))
+
         self.conf_val.setText(f"{confidence:.1f} %")
         self.lat_val.setText(f"{latency:.2f} s")
         # Green ≥70 %, yellow ≥40 %, red <40 %
@@ -581,6 +601,24 @@ class DevicePanel(QFrame):
                 self.snr_val.setText(f"{snr_db:+.1f} dB")
             else:
                 self.snr_val.setText("0.0 dB")
+
+    def get_report_data(self) -> dict:
+        """Return accumulated session metrics for CSV export."""
+        dev_idx = self.combo.currentData()
+        device_name = self.combo.currentText() if (dev_idx is not None and dev_idx >= 0) else ""
+
+        def _avg(lst: list[float]) -> float | None:
+            return sum(lst) / len(lst) if lst else None
+
+        return {
+            "slot": self.slot_index + 1,
+            "device_name": device_name,
+            "avg_confidence": _avg(self._confidence_history),
+            "total_latency": sum(self._latency_history) if self._latency_history else None,
+            "avg_snr": _avg(self._snr_history),
+            "segments": len(self._confidence_history),
+            "transcript": self.transcript.toPlainText().strip(),
+        }
 
     def closedown(self):
         self._stop_workers()
@@ -642,6 +680,19 @@ class MicBench(QMainWindow):
         )
         refresh_btn.clicked.connect(self._refresh_devices)
         toolbar.addWidget(refresh_btn)
+
+        toolbar.addSpacing(8)
+
+        save_btn = QPushButton("Save Report (CSV)")
+        save_btn.setFont(QFont("Segoe UI", 9))
+        save_btn.setFixedHeight(28)
+        save_btn.setStyleSheet(
+            "QPushButton { background:#1b5e20; color:white; border:none;"
+            " border-radius:4px; padding:0 12px; }"
+            "QPushButton:hover { background:#2e7d32; }"
+        )
+        save_btn.clicked.connect(self._save_report_csv)
+        toolbar.addWidget(save_btn)
 
         toolbar.addSpacing(16)
 
@@ -718,6 +769,108 @@ class MicBench(QMainWindow):
     def _refresh_all_meters(self):
         for panel in self.panels:
             panel.refresh_meter()
+
+    def _save_report_csv(self):
+        rows = [p.get_report_data() for p in self.panels]
+        active_rows = [r for r in rows if r["segments"] > 0 or r["transcript"]]
+        if not active_rows:
+            QMessageBox.information(
+                self, "No Data",
+                "No transcription data has been collected yet.\n"
+                "Start recording and speak into at least one microphone first.",
+            )
+            return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        default_name = f"mic_bench_report_{ts}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Report", default_name, "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+
+        def _fmt(v: float | None, spec: str) -> str:
+            return format(v, spec) if v is not None else ""
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+
+                # ── File header ───────────────────────────────────────────
+                w.writerow(["# Mic-Bench Report"])
+                w.writerow([f"# Generated: {now_str}"])
+                w.writerow([f"# Whisper model: {self._get_model_size()}"])
+                w.writerow([])
+
+                # ── Column headers ────────────────────────────────────────
+                w.writerow([
+                    "Slot", "Device Name",
+                    "Avg Confidence (%)", "Total Latency (s)",
+                    "Avg SNR (dB)", "Segments", "Transcript",
+                ])
+
+                # ── One row per panel ─────────────────────────────────────
+                for r in rows:
+                    transcript_flat = r["transcript"].replace("\n", " | ")
+                    w.writerow([
+                        f"Device {r['slot']}",
+                        r["device_name"],
+                        _fmt(r["avg_confidence"], ".1f"),
+                        _fmt(r["total_latency"], ".2f"),
+                        _fmt(r["avg_snr"], ".1f"),
+                        r["segments"],
+                        transcript_flat,
+                    ])
+
+                w.writerow([])
+
+                # ── Summary ───────────────────────────────────────────────
+                w.writerow(["# Summary"])
+
+                conf_rows = [(r, r["avg_confidence"]) for r in rows
+                             if r["avg_confidence"] is not None]
+                if conf_rows:
+                    best_c = max(conf_rows, key=lambda x: x[1])
+                    w.writerow([
+                        f"# Best Confidence: Device {best_c[0]['slot']}"
+                        f" - {best_c[0]['device_name']}"
+                        f" ({best_c[1]:.1f} %)"
+                    ])
+
+                snr_rows = [(r, r["avg_snr"]) for r in rows
+                            if r["avg_snr"] is not None]
+                if snr_rows:
+                    best_s = max(snr_rows, key=lambda x: x[1])
+                    w.writerow([
+                        f"# Best SNR:        Device {best_s[0]['slot']}"
+                        f" - {best_s[0]['device_name']}"
+                        f" ({best_s[1]:.1f} dB)"
+                    ])
+
+                # Lowest latency (most responsive)
+                lat_rows = [(r, r["total_latency"]) for r in rows
+                            if r["total_latency"] is not None and r["segments"] > 0]
+                if lat_rows:
+                    # Normalise by segment count for fair comparison
+                    best_l = min(
+                        lat_rows,
+                        key=lambda x: x[1] / max(x[0]["segments"], 1),
+                    )
+                    avg_lat = best_l[1] / max(best_l[0]["segments"], 1)
+                    w.writerow([
+                        f"# Fastest Avg Latency: Device {best_l[0]['slot']}"
+                        f" - {best_l[0]['device_name']}"
+                        f" ({avg_lat:.2f} s/segment)"
+                    ])
+
+        except OSError as e:
+            QMessageBox.critical(self, "Save Failed", f"Could not write file:\n{e}")
+            return
+
+        QMessageBox.information(
+            self, "Report Saved", f"Report saved successfully:\n{path}"
+        )
 
     def _refresh_devices(self):
         for panel in self.panels:
